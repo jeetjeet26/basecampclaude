@@ -644,6 +644,18 @@ async def oauth_metadata():
     })
 
 
+@app.get("/.well-known/oauth-protected-resource")
+async def oauth_protected_resource():
+    """RFC 9728 — OAuth 2.0 Protected Resource Metadata (MCP resource server discovery)."""
+    base = SERVER_BASE_URL
+    return JSONResponse({
+        "resource": base,
+        "authorization_servers": [base],
+        "bearer_methods_supported": ["header"],
+        "resource_documentation": f"{base}/health",
+    })
+
+
 @app.get("/authorize")
 async def oauth_authorize(request: Request):
     """
@@ -734,13 +746,30 @@ async def oauth_callback(code: str = "", state: str = "", error: str = ""):
 async def oauth_token(request: Request):
     """
     Token endpoint — Claude exchanges our short-lived auth code for the Basecamp access token.
+    Handles application/json, application/x-www-form-urlencoded, and raw body.
     """
     content_type = request.headers.get("content-type", "")
+    raw = await request.body()
+
+    body: dict = {}
     if "application/json" in content_type:
-        body = await request.json()
+        try:
+            body = json.loads(raw)
+        except Exception:
+            pass
+    elif "application/x-www-form-urlencoded" in content_type or "multipart/form-data" in content_type:
+        try:
+            form = await request.form()
+            body = dict(form)
+        except Exception:
+            # Fall back to manual URL-decode if python-multipart not available
+            body = dict(urllib.parse.parse_qsl(raw.decode("utf-8", errors="replace")))
     else:
-        form = await request.form()
-        body = dict(form)
+        # Try JSON first, then URL-encoded
+        try:
+            body = json.loads(raw)
+        except Exception:
+            body = dict(urllib.parse.parse_qsl(raw.decode("utf-8", errors="replace")))
 
     code = body.get("code")
     if not code:
