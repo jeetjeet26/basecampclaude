@@ -153,6 +153,22 @@ async def bc_get_paginated(path: str, token: str, params: dict = None, max_pages
     return results
 
 
+async def bc_post(path: str, token: str, body: dict) -> dict:
+    """Make an authenticated POST request to the Basecamp API."""
+    client = _http_client or httpx.AsyncClient(timeout=10.0)
+    url = f"{BASECAMP_API_BASE}{path}"
+    headers = {**_bc_headers(token), "Content-Type": "application/json"}
+    resp = await client.post(url, headers=headers, json=body, follow_redirects=True)
+    if resp.status_code == 401:
+        raise HTTPException(status_code=401, detail="Basecamp token invalid or expired")
+    if resp.status_code == 403:
+        raise HTTPException(status_code=403, detail="Permission denied")
+    if resp.status_code == 404:
+        raise HTTPException(status_code=404, detail=f"Not found: {path}")
+    resp.raise_for_status()
+    return resp.json()
+
+
 def extract_token(request: Request) -> str:
     """Extract Bearer token from Authorization header."""
     auth = request.headers.get("Authorization", "")
@@ -421,6 +437,66 @@ TOOLS = [
             },
             "required": ["type"]
         }
+    },
+    {
+        "name": "create_todo",
+        "description": "Create a new to-do item in a Basecamp to-do list.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {
+                    "type": "string",
+                    "description": "The numeric ID of the Basecamp project."
+                },
+                "todolist_id": {
+                    "type": "string",
+                    "description": "The numeric ID of the to-do list to add the item to."
+                },
+                "content": {
+                    "type": "string",
+                    "description": "The title/content of the to-do item."
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Optional longer description (plain text)."
+                },
+                "due_on": {
+                    "type": "string",
+                    "description": "Optional due date in YYYY-MM-DD format."
+                },
+                "starts_on": {
+                    "type": "string",
+                    "description": "Optional start date in YYYY-MM-DD format."
+                },
+                "notify": {
+                    "type": "boolean",
+                    "description": "Whether to notify assignees. Defaults to false."
+                }
+            },
+            "required": ["project_id", "todolist_id", "content"]
+        }
+    },
+    {
+        "name": "post_comment",
+        "description": "Post a comment on a Basecamp recording (to-do, message, document, etc.).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {
+                    "type": "string",
+                    "description": "The numeric ID of the Basecamp project."
+                },
+                "recording_id": {
+                    "type": "string",
+                    "description": "The numeric ID of the recording to comment on (to-do ID, message ID, document ID, etc.)."
+                },
+                "content": {
+                    "type": "string",
+                    "description": "The plain text content of the comment."
+                }
+            },
+            "required": ["project_id", "recording_id", "content"]
+        }
     }
 ]
 
@@ -628,6 +704,42 @@ async def execute_tool(name: str, args: dict, token: str) -> str:
             filtered = [r for r in data if r.get("type") == rec_type]
             results = [{"id": r.get("id"), "title": r.get("title"), "type": r.get("type"), "created_at": r.get("created_at"), "app_url": r.get("app_url")} for r in filtered[:50]]
             return json.dumps(results, indent=2)
+
+        elif name == "create_todo":
+            pid = args["project_id"]
+            tlid = args["todolist_id"]
+            body = {"content": args["content"]}
+            if args.get("description"):
+                body["description"] = args["description"]
+            if args.get("due_on"):
+                body["due_on"] = args["due_on"]
+            if args.get("starts_on"):
+                body["starts_on"] = args["starts_on"]
+            if args.get("notify") is not None:
+                body["notify"] = args["notify"]
+            data = await bc_post(f"{base}/buckets/{pid}/todolists/{tlid}/todos.json", token, body)
+            return json.dumps({
+                "id": data.get("id"),
+                "title": data.get("title"),
+                "created": True,
+                "app_url": data.get("app_url"),
+            }, indent=2)
+
+        elif name == "post_comment":
+            pid = args["project_id"]
+            rid = args["recording_id"]
+            data = await bc_post(
+                f"{base}/buckets/{pid}/recordings/{rid}/comments.json",
+                token,
+                {"content": args["content"]},
+            )
+            return json.dumps({
+                "id": data.get("id"),
+                "content": data.get("content"),
+                "creator": data.get("creator", {}).get("name"),
+                "created_at": data.get("created_at"),
+                "posted": True,
+            }, indent=2)
 
         else:
             return json.dumps({"error": f"Unknown tool: {name}"})
