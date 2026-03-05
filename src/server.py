@@ -140,10 +140,22 @@ def extract_account_id(token_data: dict) -> str:
 
 
 async def get_account_id(token: str) -> str:
-    """Return the Basecamp account ID for this token, using an in-process cache."""
+    """Return the Basecamp account ID for this token, using an in-process cache.
+
+    Authorization data lives at launchpad.37signals.com, not 3.basecampapi.com.
+    """
     if token in _account_id_cache:
         return _account_id_cache[token]
-    auth_data = await bc_get("/authorization.json", token)
+    client = _http_client or httpx.AsyncClient(timeout=10.0)
+    resp = await client.get(
+        f"{BASECAMP_AUTH_BASE}/authorization.json",
+        headers=_bc_headers(token),
+        follow_redirects=True,
+    )
+    if resp.status_code == 401:
+        raise HTTPException(status_code=401, detail="Basecamp token invalid or expired")
+    resp.raise_for_status()
+    auth_data = resp.json()
     account_id = extract_account_id(auth_data)
     if len(_account_id_cache) >= 500:
         _account_id_cache.pop(next(iter(_account_id_cache)))
