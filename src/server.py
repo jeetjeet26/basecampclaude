@@ -3,6 +3,9 @@ Basecamp MCP Server — Read-Only Connector for Claude Cowork
 Implements MCP Streamable HTTP transport (2025-06-18 spec) with OAuth 2.0 proxy.
 """
 
+import base64
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -62,13 +65,43 @@ SERVER_BASE_URL = os.environ.get(
 ).rstrip("/")
 
 # ---------------------------------------------------------------------------
-# In-memory OAuth state stores
-# These survive only for the duration of a single OAuth flow (seconds).
-# ---------------------------------------------------------------------------
-# state_id -> {claude_redirect_uri, claude_state}
-_pending_states: dict[str, dict] = {}
-# auth_code -> basecamp_token_response dict
-_pending_codes: dict[str, dict] = {}
+# Secret used to sign stateless OAuth tokens so they can't be forged.
+# Generated once per deployment; set as OAUTH_SECRET env var for stability.
+SECRET_KEY = os.environ.get("OAUTH_SECRET", os.urandom(32).hex()).encode()
+
+
+def _b64_encode(data: dict) -> str:
+    """Encode a dict as URL-safe base64."""
+    return base64.urlsafe_b64encode(json.dumps(data).encode()).decode().rstrip("=")
+
+
+def _b64_decode(s: str) -> dict:
+    """Decode a URL-safe base64 string back to a dict."""
+    padding = 4 - len(s) % 4
+    return json.loads(base64.urlsafe_b64decode(s + "=" * padding).decode())
+
+
+def _sign(payload: str) -> str:
+    """Return HMAC-SHA256 hex digest of payload."""
+    return hmac.new(SECRET_KEY, payload.encode(), hashlib.sha256).hexdigest()
+
+
+def _make_signed_token(data: dict) -> str:
+    """Encode data + HMAC signature into a URL-safe token."""
+    payload = _b64_encode(data)
+    sig = _sign(payload)
+    return f"{payload}.{sig}"
+
+
+def _decode_signed_token(token: str) -> dict | None:
+    """Verify signature and decode token. Returns None if invalid."""
+    try:
+        payload, sig = token.rsplit(".", 1)
+        if not hmac.compare_digest(_sign(payload), sig):
+            return None
+        return _b64_decode(payload)
+    except Exception:
+        return None
 
 # ---------------------------------------------------------------------------
 # Basecamp API client
@@ -699,6 +732,9 @@ async def oauth_authorize(request: Request):
     """
     OAuth authorization endpoint.
     Claude redirects the user here; we proxy them through Basecamp's OAuth.
+
+    Stateless: Claude's redirect_uri and state are encoded into a signed token
+    that travels as Basecamp's `state` parameter — no server-side storage needed.
     """
     params = dict(request.query_params)
     claude_redirect_uri = params.get("redirect_uri", "")
@@ -707,12 +743,11 @@ async def oauth_authorize(request: Request):
     if not BASECAMP_CLIENT_ID:
         raise HTTPException(status_code=500, detail="BASECAMP_CLIENT_ID not configured")
 
-    # Save Claude's redirect info so we can return to it after Basecamp auth
-    our_state = str(uuid.uuid4())
-    _pending_states[our_state] = {
-        "claude_redirect_uri": claude_redirect_uri,
-        "claude_state": claude_state,
-    }
+    # Encode Claude's context into a signed state token for Basecamp
+    our_state = _make_signed_token({
+        "r": claude_redirect_uri,
+        "s": claude_state,
+    })
 
     our_callback = f"{SERVER_BASE_URL}/oauth/callback"
     basecamp_url = (
@@ -720,7 +755,7 @@ async def oauth_authorize(request: Request):
         f"?type=web_server"
         f"&client_id={urllib.parse.quote(BASECAMP_CLIENT_ID)}"
         f"&redirect_uri={urllib.parse.quote(our_callback, safe='')}"
-        f"&state={our_state}"
+        f"&state={urllib.parse.quote(our_state, safe='')}"
     )
     return RedirectResponse(url=basecamp_url, status_code=302)
 
@@ -729,14 +764,19 @@ async def oauth_authorize(request: Request):
 async def oauth_callback(code: str = "", state: str = "", error: str = ""):
     """
     Basecamp redirects back here after user authorization.
-    Exchange the code for a Basecamp token, then redirect back to Claude.
+
+    Stateless: Claude's context is recovered by verifying and decoding the signed
+    state token. The Basecamp access_token is itself signed and sent back to Claude
+    as the auth code — no server-side storage needed.
     """
-    state_data = _pending_states.pop(state, None)
+    state_data = _decode_signed_token(state)
     if not state_data:
         raise HTTPException(status_code=400, detail="Invalid or expired OAuth state")
 
+    claude_redirect = state_data.get("r", "")
+    claude_state = state_data.get("s", "")
+
     if error:
-        claude_redirect = state_data["claude_redirect_uri"]
         return RedirectResponse(
             url=f"{claude_redirect}?error={urllib.parse.quote(error)}",
             status_code=302
@@ -767,13 +807,15 @@ async def oauth_callback(code: str = "", state: str = "", error: str = ""):
         )
     token_data = resp.json()
 
-    # Mint a short-lived auth code for Claude to exchange
-    auth_code = str(uuid.uuid4())
-    _pending_codes[auth_code] = token_data
+    # Encode the token as a signed auth code — no server-side storage
+    auth_code = _make_signed_token({
+        "at": token_data.get("access_token"),
+        "rt": token_data.get("refresh_token"),
+        "ei": token_data.get("expires_in"),
+        "tt": token_data.get("token_type", "Bearer"),
+    })
 
-    claude_redirect = state_data["claude_redirect_uri"]
-    claude_state = state_data["claude_state"]
-    callback_url = f"{claude_redirect}?code={auth_code}"
+    callback_url = f"{claude_redirect}?code={urllib.parse.quote(auth_code, safe='')}"
     if claude_state:
         callback_url += f"&state={urllib.parse.quote(claude_state, safe='')}"
 
@@ -783,8 +825,8 @@ async def oauth_callback(code: str = "", state: str = "", error: str = ""):
 @app.post("/token")
 async def oauth_token(request: Request):
     """
-    Token endpoint — Claude exchanges our short-lived auth code for the Basecamp access token.
-    Handles application/json, application/x-www-form-urlencoded, and raw body.
+    Token endpoint — Claude exchanges the signed auth code for the Basecamp access token.
+    Stateless: the code IS the signed token containing the access_token.
     """
     content_type = request.headers.get("content-type", "")
     raw = await request.body()
@@ -800,10 +842,8 @@ async def oauth_token(request: Request):
             form = await request.form()
             body = dict(form)
         except Exception:
-            # Fall back to manual URL-decode if python-multipart not available
             body = dict(urllib.parse.parse_qsl(raw.decode("utf-8", errors="replace")))
     else:
-        # Try JSON first, then URL-encoded
         try:
             body = json.loads(raw)
         except Exception:
@@ -816,18 +856,18 @@ async def oauth_token(request: Request):
             content={"error": "invalid_request", "error_description": "Missing code"}
         )
 
-    token_data = _pending_codes.pop(code, None)
-    if not token_data:
+    token_data = _decode_signed_token(code)
+    if not token_data or "at" not in token_data:
         return JSONResponse(
             status_code=400,
             content={"error": "invalid_grant", "error_description": "Invalid or expired code"}
         )
 
     return JSONResponse({
-        "access_token": token_data.get("access_token"),
-        "token_type": token_data.get("token_type", "Bearer"),
-        "refresh_token": token_data.get("refresh_token"),
-        "expires_in": token_data.get("expires_in"),
+        "access_token": token_data["at"],
+        "token_type": token_data.get("tt", "Bearer"),
+        "refresh_token": token_data.get("rt"),
+        "expires_in": token_data.get("ei"),
         "scope": "",
     })
 
