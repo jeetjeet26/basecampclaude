@@ -28,6 +28,29 @@ BASECAMP_API_BASE = "https://3.basecampapi.com"
 BASECAMP_AUTH_BASE = "https://launchpad.37signals.com"
 USER_AGENT = "BasecampMCP-Claude/1.0 (claude-connector)"
 
+# Shared async HTTP client — reused across requests for connection pooling.
+# 10-second timeout prevents tool calls from hanging indefinitely.
+_http_client: httpx.AsyncClient | None = None
+
+# Cache account_id per token — avoids an extra Basecamp roundtrip on every tool call.
+# Tokens are long-lived per session so this is safe. Capped at 500 entries.
+_account_id_cache: dict[str, str] = {}
+
+
+@app.on_event("startup")
+async def _startup():
+    global _http_client
+    _http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(10.0),
+        limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+    )
+
+
+@app.on_event("shutdown")
+async def _shutdown():
+    if _http_client:
+        await _http_client.aclose()
+
 # OAuth config — set via Heroku config vars
 BASECAMP_CLIENT_ID = os.environ.get("BASECAMP_CLIENT_ID", "")
 BASECAMP_CLIENT_SECRET = os.environ.get("BASECAMP_CLIENT_SECRET", "")
@@ -51,54 +74,49 @@ _pending_codes: dict[str, dict] = {}
 # Basecamp API client
 # ---------------------------------------------------------------------------
 
+def _bc_headers(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}", "User-Agent": USER_AGENT}
+
+
 async def bc_get(path: str, token: str, params: dict = None) -> dict | list:
     """Make an authenticated GET request to the Basecamp API."""
+    client = _http_client or httpx.AsyncClient(timeout=10.0)
     url = f"{BASECAMP_API_BASE}{path}"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "User-Agent": USER_AGENT,
-    }
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(url, headers=headers, params=params or {}, follow_redirects=True)
-        if resp.status_code == 401:
-            raise HTTPException(status_code=401, detail="Basecamp token invalid or expired")
-        if resp.status_code == 404:
-            raise HTTPException(status_code=404, detail=f"Not found: {path}")
-        resp.raise_for_status()
-        return resp.json()
+    resp = await client.get(url, headers=_bc_headers(token), params=params or {}, follow_redirects=True)
+    if resp.status_code == 401:
+        raise HTTPException(status_code=401, detail="Basecamp token invalid or expired")
+    if resp.status_code == 404:
+        raise HTTPException(status_code=404, detail=f"Not found: {path}")
+    resp.raise_for_status()
+    return resp.json()
 
 
 async def bc_get_paginated(path: str, token: str, params: dict = None, max_pages: int = 5) -> list:
-    """Fetch all pages from a paginated Basecamp endpoint."""
+    """Fetch all pages from a paginated Basecamp endpoint using the shared client."""
+    client = _http_client or httpx.AsyncClient(timeout=10.0)
     url = f"{BASECAMP_API_BASE}{path}"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "User-Agent": USER_AGENT,
-    }
+    headers = _bc_headers(token)
     results = []
     page = 1
-    # Only pass params on the first request; subsequent pages use the full next URL from Link header
     first_request_params = params or {}
-    async with httpx.AsyncClient() as client:
-        while url and page <= max_pages:
-            req_params = first_request_params if page == 1 else {}
-            resp = await client.get(url, headers=headers, params=req_params, follow_redirects=True)
-            resp.raise_for_status()
-            data = resp.json()
-            if isinstance(data, list):
-                results.extend(data)
-            else:
-                results.append(data)
-            # Follow Link header for next page
-            link_header = resp.headers.get("Link", "")
-            next_url = None
-            for part in link_header.split(","):
-                if 'rel="next"' in part:
-                    match = re.search(r"<([^>]+)>", part)
-                    if match:
-                        next_url = match.group(1)
-            url = next_url
-            page += 1
+    while url and page <= max_pages:
+        req_params = first_request_params if page == 1 else {}
+        resp = await client.get(url, headers=headers, params=req_params, follow_redirects=True)
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, list):
+            results.extend(data)
+        else:
+            results.append(data)
+        link_header = resp.headers.get("Link", "")
+        next_url = None
+        for part in link_header.split(","):
+            if 'rel="next"' in part:
+                match = re.search(r"<([^>]+)>", part)
+                if match:
+                    next_url = match.group(1)
+        url = next_url
+        page += 1
     return results
 
 
@@ -115,11 +133,22 @@ def extract_account_id(token_data: dict) -> str:
     for acct in token_data.get("accounts", []):
         if acct.get("product") == "bc3":
             href = acct.get("href", "")
-            # href = https://3.basecampapi.com/ACCOUNT_ID
             match = re.search(r"/(\d+)$", href)
             if match:
                 return match.group(1)
     raise HTTPException(status_code=400, detail="No Basecamp 4 account found for this token")
+
+
+async def get_account_id(token: str) -> str:
+    """Return the Basecamp account ID for this token, using an in-process cache."""
+    if token in _account_id_cache:
+        return _account_id_cache[token]
+    auth_data = await bc_get("/authorization.json", token)
+    account_id = extract_account_id(auth_data)
+    if len(_account_id_cache) >= 500:
+        _account_id_cache.pop(next(iter(_account_id_cache)))
+    _account_id_cache[token] = account_id
+    return account_id
 
 
 # ---------------------------------------------------------------------------
@@ -357,13 +386,10 @@ TOOLS = [
 
 async def execute_tool(name: str, args: dict, token: str) -> str:
     """Execute a named tool and return a text result."""
-
-    # First, resolve account_id from the token
-    auth_data = await bc_get("/authorization.json", token)
-    account_id = extract_account_id(auth_data)
-    base = f"/{account_id}"
-
     try:
+        account_id = await get_account_id(token)
+        base = f"/{account_id}"
+
         if name == "get_my_profile":
             data = await bc_get(f"{base}/my/profile.json", token)
             return json.dumps({
@@ -710,24 +736,24 @@ async def oauth_callback(code: str = "", state: str = "", error: str = ""):
     our_callback = f"{SERVER_BASE_URL}/oauth/callback"
 
     # Exchange Basecamp code for access token
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            f"{BASECAMP_AUTH_BASE}/authorization/token",
-            params={
-                "type": "web_server",
-                "client_id": BASECAMP_CLIENT_ID,
-                "client_secret": BASECAMP_CLIENT_SECRET,
-                "redirect_uri": our_callback,
-                "code": code,
-            },
-            headers={"User-Agent": USER_AGENT},
+    client = _http_client or httpx.AsyncClient(timeout=10.0)
+    resp = await client.post(
+        f"{BASECAMP_AUTH_BASE}/authorization/token",
+        params={
+            "type": "web_server",
+            "client_id": BASECAMP_CLIENT_ID,
+            "client_secret": BASECAMP_CLIENT_SECRET,
+            "redirect_uri": our_callback,
+            "code": code,
+        },
+        headers={"User-Agent": USER_AGENT},
+    )
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Basecamp token exchange failed: {resp.text}"
         )
-        if resp.status_code != 200:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Basecamp token exchange failed: {resp.text}"
-            )
-        token_data = resp.json()
+    token_data = resp.json()
 
     # Mint a short-lived auth code for Claude to exchange
     auth_code = str(uuid.uuid4())
