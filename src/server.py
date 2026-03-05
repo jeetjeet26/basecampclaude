@@ -1,16 +1,18 @@
 """
 Basecamp MCP Server — Read-Only Connector for Claude Cowork
-Implements MCP Streamable HTTP transport (2025-06-18 spec)
+Implements MCP Streamable HTTP transport (2025-06-18 spec) with OAuth 2.0 proxy.
 """
 
 import json
+import os
 import re
+import urllib.parse
 import uuid
 import httpx
 import asyncio
 from typing import Any
 from fastapi import FastAPI, Request, Response, HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="Basecamp MCP Connector")
@@ -23,7 +25,27 @@ app.add_middleware(
 )
 
 BASECAMP_API_BASE = "https://3.basecampapi.com"
+BASECAMP_AUTH_BASE = "https://launchpad.37signals.com"
 USER_AGENT = "BasecampMCP-Claude/1.0 (claude-connector)"
+
+# OAuth config — set via Heroku config vars
+BASECAMP_CLIENT_ID = os.environ.get("BASECAMP_CLIENT_ID", "")
+BASECAMP_CLIENT_SECRET = os.environ.get("BASECAMP_CLIENT_SECRET", "")
+
+# The public base URL of this server — used to build redirect URIs
+SERVER_BASE_URL = os.environ.get(
+    "SERVER_BASE_URL",
+    "https://basecamp-mcp-claude-38e78468b14b.herokuapp.com"
+).rstrip("/")
+
+# ---------------------------------------------------------------------------
+# In-memory OAuth state stores
+# These survive only for the duration of a single OAuth flow (seconds).
+# ---------------------------------------------------------------------------
+# state_id -> {claude_redirect_uri, claude_state}
+_pending_states: dict[str, dict] = {}
+# auth_code -> basecamp_token_response dict
+_pending_codes: dict[str, dict] = {}
 
 # ---------------------------------------------------------------------------
 # Basecamp API client
@@ -599,6 +621,148 @@ async def handle_mcp_request(body: dict, token: str) -> dict:
             "id": req_id,
             "error": {"code": -32601, "message": f"Method not found: {method}"}
         }
+
+
+# ---------------------------------------------------------------------------
+# OAuth 2.0 Proxy Endpoints
+# Claude cowork expects the MCP server to be an OAuth 2.0 authorization server
+# that proxies through to Basecamp's OAuth.
+# ---------------------------------------------------------------------------
+
+@app.get("/.well-known/oauth-authorization-server")
+async def oauth_metadata():
+    """RFC 8414 — OAuth 2.0 Authorization Server Metadata (used by Claude for discovery)."""
+    base = SERVER_BASE_URL
+    return JSONResponse({
+        "issuer": base,
+        "authorization_endpoint": f"{base}/authorize",
+        "token_endpoint": f"{base}/token",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code"],
+        "code_challenge_methods_supported": ["S256", "plain"],
+        "token_endpoint_auth_methods_supported": ["client_secret_post", "none"],
+    })
+
+
+@app.get("/authorize")
+async def oauth_authorize(request: Request):
+    """
+    OAuth authorization endpoint.
+    Claude redirects the user here; we proxy them through Basecamp's OAuth.
+    """
+    params = dict(request.query_params)
+    claude_redirect_uri = params.get("redirect_uri", "")
+    claude_state = params.get("state", "")
+
+    if not BASECAMP_CLIENT_ID:
+        raise HTTPException(status_code=500, detail="BASECAMP_CLIENT_ID not configured")
+
+    # Save Claude's redirect info so we can return to it after Basecamp auth
+    our_state = str(uuid.uuid4())
+    _pending_states[our_state] = {
+        "claude_redirect_uri": claude_redirect_uri,
+        "claude_state": claude_state,
+    }
+
+    our_callback = f"{SERVER_BASE_URL}/oauth/callback"
+    basecamp_url = (
+        f"{BASECAMP_AUTH_BASE}/authorization/new"
+        f"?type=web_server"
+        f"&client_id={urllib.parse.quote(BASECAMP_CLIENT_ID)}"
+        f"&redirect_uri={urllib.parse.quote(our_callback, safe='')}"
+        f"&state={our_state}"
+    )
+    return RedirectResponse(url=basecamp_url, status_code=302)
+
+
+@app.get("/oauth/callback")
+async def oauth_callback(code: str = "", state: str = "", error: str = ""):
+    """
+    Basecamp redirects back here after user authorization.
+    Exchange the code for a Basecamp token, then redirect back to Claude.
+    """
+    state_data = _pending_states.pop(state, None)
+    if not state_data:
+        raise HTTPException(status_code=400, detail="Invalid or expired OAuth state")
+
+    if error:
+        claude_redirect = state_data["claude_redirect_uri"]
+        return RedirectResponse(
+            url=f"{claude_redirect}?error={urllib.parse.quote(error)}",
+            status_code=302
+        )
+
+    if not BASECAMP_CLIENT_SECRET:
+        raise HTTPException(status_code=500, detail="BASECAMP_CLIENT_SECRET not configured")
+
+    our_callback = f"{SERVER_BASE_URL}/oauth/callback"
+
+    # Exchange Basecamp code for access token
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"{BASECAMP_AUTH_BASE}/authorization/token",
+            params={
+                "type": "web_server",
+                "client_id": BASECAMP_CLIENT_ID,
+                "client_secret": BASECAMP_CLIENT_SECRET,
+                "redirect_uri": our_callback,
+                "code": code,
+            },
+            headers={"User-Agent": USER_AGENT},
+        )
+        if resp.status_code != 200:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Basecamp token exchange failed: {resp.text}"
+            )
+        token_data = resp.json()
+
+    # Mint a short-lived auth code for Claude to exchange
+    auth_code = str(uuid.uuid4())
+    _pending_codes[auth_code] = token_data
+
+    claude_redirect = state_data["claude_redirect_uri"]
+    claude_state = state_data["claude_state"]
+    callback_url = f"{claude_redirect}?code={auth_code}"
+    if claude_state:
+        callback_url += f"&state={urllib.parse.quote(claude_state, safe='')}"
+
+    return RedirectResponse(url=callback_url, status_code=302)
+
+
+@app.post("/token")
+async def oauth_token(request: Request):
+    """
+    Token endpoint — Claude exchanges our short-lived auth code for the Basecamp access token.
+    """
+    content_type = request.headers.get("content-type", "")
+    if "application/json" in content_type:
+        body = await request.json()
+    else:
+        form = await request.form()
+        body = dict(form)
+
+    code = body.get("code")
+    if not code:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_request", "error_description": "Missing code"}
+        )
+
+    token_data = _pending_codes.pop(code, None)
+    if not token_data:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_grant", "error_description": "Invalid or expired code"}
+        )
+
+    return JSONResponse({
+        "access_token": token_data.get("access_token"),
+        "token_type": token_data.get("token_type", "Bearer"),
+        "refresh_token": token_data.get("refresh_token"),
+        "expires_in": token_data.get("expires_in"),
+        "scope": "",
+    })
 
 
 # ---------------------------------------------------------------------------
